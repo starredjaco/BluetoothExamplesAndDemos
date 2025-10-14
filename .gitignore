@@ -5,3 +5,7 @@
 x64/
 [Bb]in/
 [Oo]bj/
+
+# Python
+__pycache__/
+venv/
