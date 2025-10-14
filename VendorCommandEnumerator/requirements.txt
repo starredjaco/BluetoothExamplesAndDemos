@@ -1,4 +1,3 @@
 rich
 scapy
-scapy_usbbluetooth
-usbbluetooth
+scapy_usbbluetooth>=0.1.0

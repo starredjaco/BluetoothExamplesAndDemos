@@ -20,7 +20,7 @@ BANNER = r'''                                                                   
 console.print(BANNER)
 
 # Select a controller
-devices = usbbluetooth.list_devices()
+devices = usbbluetooth.list_controllers()
 for i, dev in enumerate(devices):
     console.print(f'{i}) {dev}')
 dev_idx = IntPrompt().ask('Select a Bluetooth controller', console=console,
@@ -43,11 +43,11 @@ if not HCI_Event_Command_Complete in response or response[HCI_Event_Command_Comp
 
 # OCF can range from 0x00 to 0x3FF (10 bits)
 opcodes = []
-for ocf in range(0x400):  # 0 to 0x3FF
+for ocf in range(0x000, 0x3FF):  # 0 to 0x3FF
     pkt = HCI_Hdr() / HCI_Command_Hdr(ogf=0x3f, ocf=ocf, len=0)
     console.log(f"Testing opcode 0x{pkt[HCI_Command_Hdr].opcode:04x}...")
     response = socket.sr1(pkt, verbose=0, timeout=1)
-    if not response or HCI_Event_Command_Complete in response and response[HCI_Event_Command_Complete].status != 1:
+    if response is not None and HCI_Event_Command_Complete in response and response[HCI_Event_Command_Complete].status != 1:
         opcodes.append(pkt[HCI_Command_Hdr].opcode)
         console.log("Possible working command.")
         if response:
@@ -55,7 +55,7 @@ for ocf in range(0x400):  # 0 to 0x3FF
             response.show()
 
 if len(opcodes) != 0:
-    console.log(f"Device description: {device.get_description()}")
+    console.log(f"Device description: {device}")
     op_str = [f"0x{op:04x}" for op in opcodes]
     console.log(f"Possible vendor opcodes: {', '.join(op_str)}")
     console.log("Local version information:")
