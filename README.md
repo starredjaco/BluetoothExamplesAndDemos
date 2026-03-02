@@ -10,6 +10,13 @@ A collection of Bluetooth spamming proof of concepts in a single C# application.
 ![BleSpammer screenshot](BleSpammer/screenshot.png)
 
 
+## PopLed Controller
+
+A script to take control of LED panels and screens.
+
+![PopLed Controller screenshot](PopLedController/screenshot.png)
+
+
 ## Vendor Command Enumerator
 
 A single Python script that enumerates all possible hidden HCI vendor commands of a device.
