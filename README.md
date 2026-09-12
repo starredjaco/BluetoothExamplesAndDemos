@@ -3,6 +3,13 @@
 A collection of Bluetooth tools, examples and demos useful for tools development based on UsbBluetooth.
 
 
+## BdAddr Changer
+
+Show and change the BDADDR of your Bluetooth controllers!
+
+![BdAddr Changer screenshot](BdAddrChanger/screenshot.png)
+
+
 ## BleSpammer
 
 A collection of Bluetooth spamming proof of concepts in a single C# application. Does not require any special hardware!

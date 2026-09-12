@@ -1,0 +1,8 @@
+rich
+scapy_usbbluetooth>=0.1.0
+
+# Once espressif is merged, switch to:
+#   scapy @ git+https://github.com/secdev/scapy.git@8a988e44eca33d5005875395efef3b172eaddadc
+# Once a release takes place, switch to:
+#   scapy>=2.8.0
+scapy @ git+https://github.com/antoniovazquezblanco/scapy.git@f165aeaf86896c99dae388cc5f50aa90f273c0ca
