@@ -17,6 +17,13 @@ Extract Bluetooth controller information using the standard HCI commands and hid
 ![ControllerInfo screenshot](ControllerInfo/screenshot.png)
 
 
+## Firmware Dumper
+
+A script that detects a Bluetooth controller and tries to extract it's firmware to a dump file.
+
+![Firmware Dumper screenshot](FirmwareDumper/screenshot.png)
+
+
 ## PopLed Controller
 
 A script to take control of LED panels and screens.
