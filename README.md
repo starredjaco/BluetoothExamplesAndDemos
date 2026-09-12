@@ -10,6 +10,13 @@ A collection of Bluetooth spamming proof of concepts in a single C# application.
 ![BleSpammer screenshot](BleSpammer/screenshot.png)
 
 
+## Controller Info
+
+Extract Bluetooth controller information using the standard HCI commands and hidden vendor commands.
+
+![ControllerInfo screenshot](ControllerInfo/screenshot.png)
+
+
 ## PopLed Controller
 
 A script to take control of LED panels and screens.
