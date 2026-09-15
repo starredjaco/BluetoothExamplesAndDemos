@@ -1,8 +1,9 @@
 """Change the BD_ADDR of a CSR / BlueCore controller (USB VID 0x0A12).
 
-CSR chips have no simple "set address" command; the address lives in the
-persistent store as PSKEY_BDADDR (0x0001) and is changed with the BCCMD
-(BlueCore Command) vendor protocol carried over HCI opcode 0xFC00:
+CSR chips (the legacy Cambridge Silicon Radio line Qualcomm bought in 2015) have
+no simple "set address" command; the address lives in the persistent store as
+PSKEY_BDADDR (0x0001) and is changed with the BCCMD (BlueCore Command) vendor
+protocol carried over HCI opcode 0xFC00:
 
   1. SETREQ writing PSKEY_BDADDR through the PS door (varid 0x7003), and
   2. a COLD_RESET (varid 0x4001) so the controller reboots and loads it.
@@ -12,16 +13,18 @@ controller **re-enumerate** on USB, so this changer overrides ``change`` and
 drives the whole flow itself (write -> reset -> re-find the dongle by its new
 address -> verify).
 
+The BCCMD framing comes from the packet definitions in
+``scapy.contrib.bluetooth_vsc_csr`` (``HCI_Cmd_VSC_CSR_BCCMD``, the ``CSR_PS``
+value structure and its ``CSR_PS_BDADDR`` sub-structure); this module composes
+the GETREQ/SETREQ/reset commands from them and reads the response through the
+registered ``HCI_Event_VSC_CSR_BCCMD`` handler.
+
 Many cheap "CSR8510" dongles are clones whose PS door is **stubbed**: a write
 returns a fake ``status=0x0000`` OK but persists nothing. This changer detects
 that (the PS read returns a truncated echo instead of the real key) and reports
 it instead of falsely claiming success.
-
-The BCCMD framing is built inline here (it does not depend on
-``scapy.contrib.bluetooth_vsc_csr``).
 """
 
-import struct
 import time
 
 import usbbluetooth
@@ -32,21 +35,64 @@ from scapy.layers.bluetooth import HCI_Hdr, HCI_Command_Hdr, HCI_Cmd_Reset
 from common import Changer, read_bd_addr
 
 try:
-    import usb.core
-    _TIMEOUT_EXC = (usb.core.USBTimeoutError,)
-except Exception:                       # pragma: no cover
-    _TIMEOUT_EXC = ()
+    from scapy.contrib.bluetooth_vsc_csr import (
+        HCI_Cmd_VSC_CSR_BCCMD,
+        HCI_Event_VSC_CSR_BCCMD,
+        CSR_PS,
+        CSR_PS_BDADDR,
+    )
+    _AVAILABLE = True
+except ImportError:
+    _AVAILABLE = False
 
 _VENDOR_ID = 0x0A12
-_BCCMD_OPCODE = 0xFC00
-_PDU_GETREQ = 0x0000
-_PDU_SETREQ = 0x0002
 _VARID_PS = 0x7003
+_VARID_COLD_RESET = 0x4001
 _PSKEY_BDADDR = 0x0001
 
 
 def _controllers():
     return [c for c in usbbluetooth.list_controllers() if c.vendor_id == _VENDOR_ID]
+
+
+# --- BD_ADDR <-> PSKEY_BDADDR (CSR NAP/UAP/LAP split), via CSR_PS_BDADDR -------
+
+def _bdaddr_value(mac):
+    """'aa:bb:cc:dd:ee:ff' -> 8-byte PSKEY_BDADDR value (aa = NAP high byte)."""
+    aa, bb, cc, dd, ee, ff = (int(x, 16) for x in mac.split(":"))
+    return bytes(CSR_PS_BDADDR(lap_hi=dd, lap_lo=(ee << 8) | ff,
+                               uap=cc, nap=(aa << 8) | bb))
+
+
+def _value_bdaddr(value):
+    """Inverse of :func:`_bdaddr_value`."""
+    b = CSR_PS_BDADDR(bytes(value))
+    lap = (b.lap_hi << 16) | b.lap_lo
+    return "%02x:%02x:%02x:%02x:%02x:%02x" % (
+        (b.nap >> 8) & 0xFF, b.nap & 0xFF, b.uap & 0xFF,
+        (lap >> 16) & 0xFF, (lap >> 8) & 0xFF, lap & 0xFF)
+
+
+# --- command construction from the packet definitions ------------------------
+
+def _ps_read_cmd(pskey, nwords=4):
+    return HCI_Cmd_VSC_CSR_BCCMD(
+        pdu_type="getreq", varid=_VARID_PS,
+        value=bytes(CSR_PS(pskey=pskey, pslen=nwords, stores=0,
+                           value=b"\x00" * (nwords * 2))))
+
+
+def _ps_write_bdaddr_cmd(mac):
+    val = bytes(CSR_PS(pskey=_PSKEY_BDADDR, pslen=4, stores=0,
+                       value=_bdaddr_value(mac)))
+    return HCI_Cmd_VSC_CSR_BCCMD(pdu_type="setreq", seqno=0x4711,
+                                 varid=_VARID_PS, value=val)
+
+
+def _cold_reset_cmd():
+    # Valueless action: the 8-byte value area makes the 9-word PDU BlueZ sends.
+    return HCI_Cmd_VSC_CSR_BCCMD(pdu_type="setreq", varid=_VARID_COLD_RESET,
+                                 value=b"\x00" * 8)
 
 
 def _open(controller):
@@ -55,55 +101,30 @@ def _open(controller):
     return sock
 
 
-def _send_pdu(sock, pdu, drains=8):
-    """Send a raw BCCMD PDU (the 0xC2 channel byte is prepended) and return the
-    first vendor (0xFF) event's value bytes, or None. Tolerates the pipe error a
-    reset command provokes."""
-    payload = b"\xc2" + pdu
-    cmd = b"\x01" + struct.pack("<H", _BCCMD_OPCODE) + bytes([len(payload)]) + payload
-    try:
-        sock._dev.write(cmd)
-    except Exception:
-        return None                      # e.g. a reset that drops the device
-    ep = sock._dev._event_reader.endpoint
-    for _ in range(drains):
-        try:
-            d = bytes(ep.read(300, timeout=350))
-        except _TIMEOUT_EXC:
-            break
-        except Exception:
-            break
-        if d and d[0] == 0xFF:
-            rp = d[2:]
-            if len(rp) >= 11 and rp[0] == 0xC2:
-                return rp[11:]
+def _bccmd(sock, cmd_layer, want_varid, attempts=8):
+    """Send a BCCMD command layer and return the matching GETRESP/SETRESP vendor
+    event (HCI_Event_VSC_CSR_BCCMD) whose varid echoes ``want_varid``, or None.
+    The reply rides the 0xFF vendor event, so poll ``recv`` for it."""
+    sock.send(HCI_Hdr() / HCI_Command_Hdr() / cmd_layer)
+    for _ in range(attempts):
+        pkt = sock.recv()
+        if pkt is not None and HCI_Event_VSC_CSR_BCCMD in pkt:
+            resp = pkt[HCI_Event_VSC_CSR_BCCMD]
+            if resp.varid == want_varid:
+                return resp
     return None
 
 
 def _ps_read_addr(sock):
     """Read PSKEY_BDADDR through the PS door. Returns the decoded address, or
     None if the door is stubbed (truncated echo, no real key words)."""
-    hdr = struct.pack("<HHHHH", _PDU_GETREQ, 0x000c, 0x4712, _VARID_PS, 0x0000)
-    body = struct.pack("<HHH", _PSKEY_BDADDR, 0x0004, 0x0000)
-    value = _send_pdu(sock, hdr + body + b"\x00" * 8)
-    if value is None or len(value) < 14:     # stub returns only the echoed header
+    resp = _bccmd(sock, _ps_read_cmd(_PSKEY_BDADDR, nwords=4), 0x7003)
+    if resp is None or resp.status != 0:
         return None
-    d = value[6:14]                          # the 4 BD_ADDR words
-    return f"{d[7]:02x}:{d[6]:02x}:{d[4]:02x}:{d[0]:02x}:{d[3]:02x}:{d[2]:02x}"
-
-
-def _ps_write_addr(sock, mac):
-    p = [int(x, 16) for x in mac.split(":")]  # p[0] = most significant octet
-    b = p[::-1]                               # BlueZ b[0] = least significant
-    data = bytes([b[2], 0x00, b[0], b[1], b[3], 0x00, b[4], b[5]])
-    hdr = struct.pack("<HHHHH", _PDU_SETREQ, 0x000c, 0x4711, _VARID_PS, 0x0000)
-    body = struct.pack("<HHH", _PSKEY_BDADDR, 0x0004, 0x0000)
-    _send_pdu(sock, hdr + body + data)
-
-
-def _cold_reset(sock):
-    # BlueZ csr_reset_device: SETREQ, len 9 words, varid 0x4001 (COLD_RESET).
-    _send_pdu(sock, bytes.fromhex("020009000000014000000000000000000000"), drains=2)
+    ps = CSR_PS(bytes(resp.value))
+    if len(ps.value) < 8:                 # stub returns only the echoed header
+        return None
+    return _value_bdaddr(ps.value)
 
 
 def _find_by_addr(target, timeout_s=30):
@@ -130,7 +151,7 @@ def _find_by_addr(target, timeout_s=30):
 class CSRChanger(Changer):
     vendor_id = _VENDOR_ID
     name = "CSR/BlueCore (BCCMD PSKEY_BDADDR + cold reset)"
-    available = True   # inline BCCMD framing, no scapy contrib needed
+    available = _AVAILABLE
 
     def change(self, controller, new_addr: str, console: Console) -> bool:
         """Full CSR change flow (owns open/write/reset/re-enumerate/verify)."""
@@ -147,7 +168,7 @@ class CSRChanger(Changer):
                 return False
 
             console.log(f"Writing PSKEY_BDADDR = {new_addr} via BCCMD...")
-            _ps_write_addr(sock, new_addr)
+            _bccmd(sock, _ps_write_bdaddr_cmd(new_addr), 0x7003)
             if str(_ps_read_addr(sock)).lower() != new_addr:
                 console.log("[yellow]PSKEY_BDADDR write did not persist; aborting "
                             "(no reset issued).[/yellow]")
@@ -155,7 +176,10 @@ class CSRChanger(Changer):
 
             console.log("Cold-resetting the controller to apply "
                         "(it will re-enumerate on USB)...")
-            _cold_reset(sock)
+            try:
+                sock.send(HCI_Hdr() / HCI_Command_Hdr() / _cold_reset_cmd())
+            except Exception:
+                pass                      # the reset drops the USB endpoint
         finally:
             try:
                 sock.close()
